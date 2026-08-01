@@ -5,8 +5,12 @@ on:
     branches: [ main ]
     paths-ignore:
       - 'release/**'
+      - 'ci-output/**'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - 'release/**'
+      - 'ci-output/**'
   workflow_dispatch:
 
 permissions:
@@ -21,45 +25,79 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
-
-      - name: Prepare APK
+      - name: Build with diagnostics
+        id: build
+        shell: bash
         run: |
-          mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk release/InstalledAppsViewer-v1.0.0.apk
-          sha256sum release/InstalledAppsViewer-v1.0.0.apk > release/SHA256SUMS.txt
+          set +e
+          mkdir -p ci-output release .gradle-dist
+          exec > >(tee ci-output/build.log) 2>&1
 
-      - name: Upload workflow artifact
+          echo "=== Environment ==="
+          date -u
+          uname -a
+          java -version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          which sdkmanager || true
+          ls -la "$ANDROID_HOME" || true
+
+          echo "=== Android SDK ==="
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          SDK_STATUS=$?
+
+          echo "=== Gradle ==="
+          curl -fL --retry 3 -o .gradle-dist/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          CURL_STATUS=$?
+          if [ "$CURL_STATUS" -eq 0 ]; then
+            unzip -q -o .gradle-dist/gradle.zip -d .gradle-dist
+            .gradle-dist/gradle-8.9/bin/gradle --version
+            .gradle-dist/gradle-8.9/bin/gradle :app:assembleDebug --no-daemon --stacktrace
+            BUILD_STATUS=$?
+          else
+            BUILD_STATUS=$CURL_STATUS
+          fi
+
+          if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp app/build/outputs/apk/debug/app-debug.apk release/InstalledAppsViewer-v1.0.0.apk
+            sha256sum release/InstalledAppsViewer-v1.0.0.apk > release/SHA256SUMS.txt
+          fi
+
+          echo "$SDK_STATUS" > ci-output/sdk-status.txt
+          echo "$BUILD_STATUS" > ci-output/build-status.txt
+          echo "sdk_status=$SDK_STATUS build_status=$BUILD_STATUS"
+          exit 0
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: InstalledAppsViewer-build-log
+          path: ci-output/
+          retention-days: 30
+
+      - name: Upload APK
+        if: hashFiles('release/InstalledAppsViewer-v1.0.0.apk') != ''
         uses: actions/upload-artifact@v4
         with:
           name: InstalledAppsViewer-APK
           path: release/InstalledAppsViewer-v1.0.0.apk
-          if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APK to repository
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Publish results to branch
+        if: always() && github.event_name == 'pull_request'
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add release/InstalledAppsViewer-v1.0.0.apk release/SHA256SUMS.txt
-          git commit -m "Publish built APK" || exit 0
-          git push
+          git add ci-output/ release/ || true
+          git commit -m "Store APK build results" || exit 0
+          git push origin HEAD:${{ github.head_ref }}
+
+      - name: Verify build succeeded
+        if: always()
+        shell: bash
+        run: |
+          test -f release/InstalledAppsViewer-v1.0.0.apk
+          test "$(cat ci-output/build-status.txt)" = "0"
